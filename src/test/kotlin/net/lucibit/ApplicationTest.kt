@@ -24,6 +24,7 @@ class ApplicationTest {
     fun testRoot() = testApplication {
         application {
             configureRouting()
+            configureWebSockets()
         }
         client.get("/").apply {
             assertEquals(HttpStatusCode.OK, status)

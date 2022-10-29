@@ -6,21 +6,27 @@ import kotlinx.css.*
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.response.*
-import io.ktor.server.request.*
 import io.ktor.server.routing.*
+import net.lucibit.plugins.pong.BOARD_HEIGHT
+import net.lucibit.plugins.pong.BOARD_WIDTH
 
 fun Application.configureTemplating() {
 
 
     routing {
-        get("/html-dsl") {
+        get("/index.html") {
             call.respondHtml {
+                head {
+                    script(type = "text/javascript", src = "/static/app.js") {}
+                }
                 body {
-                    h1 { +"HTML" }
-                    ul {
-                        for (n in 1..10) {
-                            li { +"$n" }
-                        }
+                    onLoad = "init();"
+                    h1 { +"Pong" }
+                    h2 { id = "message" }
+                    canvas {
+                        id = "canvas"
+                        width = "$BOARD_WIDTH"
+                        height = "$BOARD_HEIGHT"
                     }
                 }
             }
@@ -33,19 +39,6 @@ fun Application.configureTemplating() {
                 }
                 rule("h1.page-title") {
                     color = Color.white
-                }
-            }
-        }
-
-        get("/html-css-dsl") {
-            call.respondHtml {
-                head {
-                    link(rel = "stylesheet", href = "/styles.css", type = "text/css")
-                }
-                body {
-                    h1(classes = "page-title") {
-                        +"Hello from Ktor!"
-                    }
                 }
             }
         }

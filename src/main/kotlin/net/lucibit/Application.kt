@@ -10,5 +10,6 @@ fun main() {
         configureMonitoring()
         configureTemplating()
         configureRouting()
+        configureWebSockets()
     }.start(wait = true)
 }
