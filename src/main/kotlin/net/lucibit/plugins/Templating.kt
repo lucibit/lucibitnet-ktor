@@ -11,12 +11,16 @@ import net.lucibit.plugins.pong.BOARD_HEIGHT
 import net.lucibit.plugins.pong.BOARD_WIDTH
 
 fun Application.configureTemplating() {
-
-
+    val port = environment.config.port
+    val host = if (environment.developmentMode) "0.0.0.0" else "lucibit.net"
+    val server = "$host:$port"
     routing {
         get("/index.html") {
             call.respondHtml {
                 head {
+                    script(type = "text/javascript") {
+                        + "const SERVER = '$server'"
+                    }
                     script(type = "text/javascript", src = "/static/app.js") {}
                 }
                 body {
