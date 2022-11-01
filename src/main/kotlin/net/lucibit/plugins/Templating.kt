@@ -15,7 +15,7 @@ fun Application.configureTemplating() {
     val host = if (environment.developmentMode) "0.0.0.0" else "lucibit.net"
     val server = "$host:$port"
     routing {
-        get("/index.html") {
+        get("/pong.html") {
             call.respondHtml {
                 head {
                     script(type = "text/javascript") {
@@ -24,7 +24,7 @@ fun Application.configureTemplating() {
                     script(type = "text/javascript", src = "/static/app.js") {}
                 }
                 body {
-                    onLoad = "init();"
+                    onLoad = "pong();"
                     h1 { +"Pong" }
                     h2 { id = "message" }
                     canvas {

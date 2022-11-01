@@ -2,79 +2,22 @@ package net.lucibit.plugins.pong
 
 import io.ktor.server.websocket.*
 import io.ktor.websocket.*
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
+import kotlinx.coroutines.flow.cancel
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.html.P
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.Transient
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import net.lucibit.plugins.pong.PlayerSide.LEFT
 import net.lucibit.plugins.pong.PlayerSide.RIGHT
-
-const val BOARD_PADDING = 10
-const val PADDLE_HEIGHT = 60
-
-enum class Direction(val factor: Int) {
-
-    RIGHT(1),
-    LEFT(-1),
-    UP(-1),
-    DOWN(1);
-
-}
-
-enum class PlayerSide {
-    RIGHT, LEFT
-}
-
-const val PLAYER_MOVE_RESOLUTION = 20
-const val PLAYER_PADDLE_HEIGHT = 60
-const val BOARD_HEIGHT = 500
-const val BOARD_WIDTH = 500
-
-
-@Serializable
-data class Ball(val x: Int, val y: Int, var motionDirectionX: Direction, var motionDirectionY: Direction) {
-    companion object {
-        const val RADIUS = 10 // px
-    }
-}
-
-// We do not need to store the state of the board
-// - that would be too many messages to update state from server to client for when ball moves
-// - only thing that n
-@Serializable
-data class Player(
-    var y: Int,
-    val side: PlayerSide,
-) {
-    @Transient
-    lateinit var webSocket: DefaultWebSocketServerSession
-
-    constructor(side: PlayerSide, serverSession: DefaultWebSocketServerSession) : this(
-        side = side,
-        y = (BOARD_HEIGHT - 2 * BOARD_PADDING) / 2 - PLAYER_PADDLE_HEIGHT / 2
-    ) {
-        this.webSocket = serverSession
-    }
-
-    fun move(direction: Direction) {
-        val newY = y + direction.factor * PLAYER_MOVE_RESOLUTION
-        y = if (newY < 0) 0
-        else if (newY + PADDLE_HEIGHT > BOARD_HEIGHT) BOARD_HEIGHT - PADDLE_HEIGHT
-        else newY
-        println("Updated ${this.side} $y")
-    }
-}
-
-@Serializable
-data class GameState(
-    val ball: Ball,
-    var ready: Boolean = false,
-    val players: MutableMap<PlayerSide, Player> = mutableMapOf()
-)
+import java.lang.Exception
 
 @Serializable
 data class Command(
@@ -84,106 +27,138 @@ data class Command(
     var state: GameState? = null
 )
 
-class Game {
-    private val gameState: GameState
-    private val gameStateLock: Mutex = Mutex()
+fun Command.serialize(): String = Json.encodeToString(this)
 
+sealed class GameStatus {
+    class Connected(val player: Player): GameStatus()
+    object Full : GameStatus()
+    object Running : GameStatus()
+    object Waiting : GameStatus()
+}
+
+class Game {
+    private val gameState: GameState = GameState()
+    private val gameStateLock: Mutex = Mutex()
+    private var runLoop: Job? = null
 
     init {
-        val ball = Ball( // TODO randomize position and direction
-            x = (BOARD_WIDTH - 2 * BOARD_PADDING) / 2,
-            y = (BOARD_WIDTH - 2 * BOARD_PADDING) / 2,
-            motionDirectionX = Direction.LEFT,
-            motionDirectionY = Direction.DOWN
-        )
-        this.gameState = GameState(ball)
+        println(gameState)
     }
 
     suspend fun addPlayer(serverSession: DefaultWebSocketServerSession) {
-        val player: Player
-        val playerSide: PlayerSide
-        gameStateLock.withLock {
-            playerSide = if (gameState.players[LEFT] == null) {
-                LEFT
-            } else if (gameState.players[RIGHT] == null) {
-                RIGHT
-            } else {
-                serverSession.send(Json.encodeToString(Command(type = "full")))
-                return
+        updateState {
+            // check which player is connected already
+            if (gameState.players.containsKey(LEFT) && gameState.players.containsKey(RIGHT)) {
+                GameStatus.Full
             }
-            player = Player(
+            val playerSide = if (it.players[LEFT] == null) LEFT else RIGHT
+            val player = Player(
                 serverSession = serverSession,
                 side = playerSide
             )
             gameState.players[playerSide] = player
-            println("Players ${gameState.players}")
-            if (!gameState.ready && gameState.players.containsKey(LEFT) && gameState.players.containsKey(RIGHT)) {
+            if (gameState.players.containsKey(LEFT) && gameState.players.containsKey(RIGHT)) {
                 gameState.ready = true
-                start()
+            }
+            GameStatus.Connected(player)
+        }.also {
+            when(it) {
+                is GameStatus.Connected -> {
+                    if (gameState.ready) {
+                        runLoop = loop().launchIn(CoroutineScope(SupervisorJob()))
+                    }
+                    sendCommand(it.player, Command(type = "connected", playerSide = it.player.side).serialize())
+                    listen(it.player)
+                }
+                is GameStatus.Full -> serverSession.send(Command(type = "full").serialize())
+                else -> {}
             }
         }
-        //send initial start command
-        serverSession.send(Json.encodeToString(Command(type = "connected", playerSide = player.side)))
-        listen(player)
-
     }
 
-    private suspend fun start() {
-        gameState.players.values.forEach { updatePlayerClientState(it) }
-        // TODO start ball updates
+    private suspend fun loop() = flow {
+        delay(100)
+        while (gameState.ready) {
+            updateState {
+                it.moveBall()
+                GameStatus.Running
+            }.also {
+                delay(100)
+                emit(Unit)
+            }
+        }
+    }
+
+    private suspend fun movePlayer(player: Player, direction: Direction) = updateState {
+        player.move(direction)
+        GameStatus.Running
+    }
+
+    private suspend fun removePlayer(player: Player) = updateState {
+        println("Removing Player ${player.side}")
+        it.players.remove(player.side)
+        it.ready = false
+        GameStatus.Waiting
+    }.also {
+        player.webSocket.close()
+        runLoop?.let { if (it.isActive) it.cancel() }
     }
 
     private suspend fun listen(player: Player) {
+        println("Listening to player ${player.side}")
         try {
             for (frame in player.webSocket.incoming) {
                 frame as? Frame.Text ?: continue
-                executeCommand(player, frame.readText())
+                receiveCommand(player, frame.readText())
             }
         } catch (e: ClosedReceiveChannelException) {
             removePlayer(player)
-        }
-
-    }
-
-    suspend fun updateBall() {
-        gameStateLock.withLock {
-            // TODO move ball
-            gameState.players.values.forEach { updatePlayerClientState(it) }
+        } catch (e: Exception) {
+            println("Exception when listening")
+            e.printStackTrace()
         }
     }
 
-    private suspend fun movePlayer(player: Player, direction: Direction) {
-        gameStateLock.withLock {
-            println("Player ${player.side} moved $direction")
-            player.move(direction)
 
-            // notify players
-            gameState.players.values.forEach { updatePlayerClientState(it) }
+    /**
+     * Updates the state by performing an action under state lock, then notifies players online of the changes.
+     * @param action an action to perform that can mutate the state and returns [GameStatus] after action.
+     *
+     * @return [GameStatus] after update.
+     */
+    private suspend fun updateState(action: (gameState: GameState) -> GameStatus): GameStatus {
+        val onlinePlayers = mutableListOf<Player>()
+        val gameStatus: GameStatus
+        // capture serialized state after modification
+        val updateCommand = gameStateLock.withLock {
+            gameStatus = action(gameState)
+            onlinePlayers.addAll(gameState.players.values)
+            Command(type = "state", state = gameState).serialize()
         }
+        onlinePlayers.forEach { player -> sendCommand(player, updateCommand) }
+        return gameStatus
     }
 
-    private suspend fun updatePlayerClientState(player: Player) {
 
-        val command = Json.encodeToString(Command(type = "state", state = gameState))
-        println("Sending command $command")
-        player.webSocket.send(command)
-    }
-
-    private suspend fun removePlayer(player: Player) {
-        gameStateLock.withLock {
-            println("Removing player ${player.side}")
-            gameState.players.remove(player.side)
-            gameState.ready = false
-        }
-    }
-
-    private suspend fun executeCommand(player: Player, message: String) {
-        println("Received command $message")
-        val command = Json.decodeFromString<Command>(message)
-
+    private suspend fun receiveCommand(player: Player, serializedCommand: String) {
+        println("Command Received $serializedCommand")
+        val command = Json.decodeFromString<Command>(serializedCommand)
         when (command.type) {
             "move" -> movePlayer(player, direction = command.direction!!)
             "close" -> removePlayer(player)
+                .also { player.webSocket.close(CloseReason(CloseReason.Codes.NORMAL, "client said bye")) }
+        }
+    }
+
+    private suspend fun sendCommand(player: Player, serializedCommand: String) {
+        println("Sending Command $serializedCommand to player ${player.side}")
+        try {
+            player.webSocket.send(serializedCommand)
+        } catch (e: ClosedReceiveChannelException) {
+            removePlayer(player)
+        } catch (e: Exception) {
+            println("Exception when sending to player ${player.side} reason: ${player.webSocket.closeReason.await()}" )
+            e.printStackTrace()
         }
     }
 }
